@@ -1,0 +1,37 @@
+# --- large media (input + output) ---
+*.cpv
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# --- model weights ---
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# --- debug / preview frames generated during runs ---
+debug_*.jpg
+out_*.jpg
+out2_*.jpg
+merged_*.jpg
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.python-version
+
+# --- jupyter ---
+.ipynb_checkpoints/
+
+# --- macOS ---
+.DS_Store
+
+# --- editor ---
+.vscode/
+.idea/
+*.swp

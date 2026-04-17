@@ -1,0 +1,16 @@
+# BoT-SORT tuned for static CCTV cow footage.
+# Large track_buffer survives long occlusions behind pillars / shadows.
+# Higher new_track_thresh prevents low-conf flickers from spawning new IDs.
+tracker_type: botsort
+
+track_high_thresh: 0.45
+track_low_thresh:  0.15
+new_track_thresh:  0.55
+track_buffer:      750        # frames kept alive after last detection (~30s @ 25fps)
+match_thresh:      0.85
+fuse_score:        true
+
+gmc_method: sparseOptFlow    # global motion compensation
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid:         false

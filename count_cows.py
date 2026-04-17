@@ -1,0 +1,272 @@
+"""
+Two-pass cow tracking + dedup:
+
+  Pass 1 -- run COCO YOLOv8m + BoT-SORT (IoU + Kalman + GMC) on first 2 min.
+            Log every detection: (frame_idx, track_id, xyxy, conf, hsv_hist).
+
+  Merge  -- post-hoc: fuse two tracks A,B into one if B starts after A ends,
+            the temporal gap is short, their bboxes are near each other, and
+            their HSV color signatures match (cows have distinctive coats).
+            This catches the main remaining dup source: a cow that leaves
+            view / hides behind a pillar longer than the tracker buffer and
+            comes back as a "new" track.
+
+  Pass 2 -- re-read the video, apply the merged-ID map, render final MP4.
+
+Note: cow_weight_v2_12.pt is trained on UAV nadir drone imagery and yields
+zero detections on this ground-level CCTV footage (domain mismatch), so we
+fall back to COCO YOLOv8m (class 19 == cow).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+HERE = Path(__file__).parent
+MODEL_PATH = HERE / "yolov8m.pt"
+VIDEO_PATH = HERE / "NVR_ch1_main_20260331080000_20260331083835.mp4"
+OUT_PATH = HERE / "cows_annotated_first2min.mp4"
+TRACKER_YAML = HERE / "botsort_cows.yaml"
+
+COW_CLASS_ID = 19
+CONF_THRES = 0.30
+IOU_THRES = 0.5
+DURATION_SEC = 120
+DEVICE = "mps"
+IMGSZ = 1280
+
+# --- merge-pass thresholds -------------------------------------------------
+MAX_TEMPORAL_GAP_S = 45.0   # do not merge tracks separated by more than this
+MAX_CENTER_DIST_PX = 450    # A-last-center to B-first-center (in full frame)
+HIST_SIM_THRESHOLD = 0.55   # 0..1 HSV-histogram correlation (higher = stricter)
+MIN_TRACK_FRAMES = 3        # drop tracks this short as noise before merging
+
+
+@dataclass
+class Detection:
+    frame: int
+    tid: int
+    box: tuple[int, int, int, int]
+    conf: float
+
+
+@dataclass
+class Track:
+    tid: int
+    first_frame: int = 10**9
+    last_frame: int = -1
+    first_box: tuple[int, int, int, int] = (0, 0, 0, 0)
+    last_box: tuple[int, int, int, int] = (0, 0, 0, 0)
+    hist_sum: np.ndarray | None = None
+    hist_n: int = 0
+    n_frames: int = 0
+    best_conf: float = 0.0
+
+    def add(self, frame_idx: int, box, conf: float, hist: np.ndarray) -> None:
+        if frame_idx < self.first_frame:
+            self.first_frame = frame_idx
+            self.first_box = box
+        if frame_idx > self.last_frame:
+            self.last_frame = frame_idx
+            self.last_box = box
+        if self.hist_sum is None:
+            self.hist_sum = hist.copy()
+        else:
+            self.hist_sum += hist
+        self.hist_n += 1
+        self.n_frames += 1
+        self.best_conf = max(self.best_conf, conf)
+
+    @property
+    def hist(self) -> np.ndarray:
+        h = self.hist_sum / max(1, self.hist_n)
+        cv2.normalize(h, h)
+        return h
+
+
+def hsv_hist(crop: np.ndarray) -> np.ndarray:
+    """Normalised HSV histogram signature for a bbox crop."""
+    if crop.size == 0:
+        return np.zeros((16, 16), dtype=np.float32)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    # H,S histogram -- cow coat colour pattern; ignore V (lighting)
+    h = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+    cv2.normalize(h, h)
+    return h.astype(np.float32)
+
+
+def center(box) -> tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+
+def merge_tracks(tracks: dict[int, Track], fps: float) -> dict[int, int]:
+    """Return {old_tid: canonical_tid}. Greedy pair merge by temporal order."""
+    ordered = sorted(
+        (t for t in tracks.values() if t.n_frames >= MIN_TRACK_FRAMES),
+        key=lambda t: t.first_frame,
+    )
+    parent = {t.tid: t.tid for t in ordered}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    max_gap_frames = MAX_TEMPORAL_GAP_S * fps
+    merges = 0
+    for i, a in enumerate(ordered):
+        best_j: int | None = None
+        best_score = -1.0
+        for j in range(i + 1, len(ordered)):
+            b = ordered[j]
+            # b must start strictly after a ends (no temporal overlap)
+            gap = b.first_frame - a.last_frame
+            if gap <= 0 or gap > max_gap_frames:
+                continue
+            # spatial plausibility: a.last-center near b.first-center
+            ax, ay = center(a.last_box)
+            bx, by = center(b.first_box)
+            dist = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+            if dist > MAX_CENTER_DIST_PX:
+                continue
+            # appearance: HSV histogram correlation in [-1, 1]; clip to [0, 1]
+            sim = max(0.0, float(cv2.compareHist(a.hist, b.hist, cv2.HISTCMP_CORREL)))
+            if sim < HIST_SIM_THRESHOLD:
+                continue
+            # score = appearance * spatial closeness * recency
+            score = sim * (1 - dist / MAX_CENTER_DIST_PX) * (1 - gap / max_gap_frames)
+            if score > best_score:
+                best_score = score
+                best_j = j
+        if best_j is not None:
+            b = ordered[best_j]
+            ra, rb = find(a.tid), find(b.tid)
+            if ra != rb:
+                parent[rb] = ra
+                merges += 1
+
+    print(f"  merge pass: fused {merges} track pairs")
+    return {tid: find(tid) for tid in parent}
+
+
+def pass1_track(model: YOLO, cap: cv2.VideoCapture, fps: float, max_frames: int
+                ) -> tuple[list[Detection], dict[int, Track]]:
+    tracks: dict[int, Track] = {}
+    dets: list[Detection] = []
+    frame_idx = 0
+    while frame_idx < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        r = model.track(
+            source=frame, persist=True,
+            tracker=str(TRACKER_YAML), classes=[COW_CLASS_ID],
+            conf=CONF_THRES, iou=IOU_THRES, imgsz=IMGSZ,
+            device=DEVICE, verbose=False,
+        )[0]
+        if r.boxes is not None and r.boxes.id is not None:
+            for (x1, y1, x2, y2), tid, conf in zip(
+                r.boxes.xyxy.cpu().numpy(),
+                r.boxes.id.int().cpu().tolist(),
+                r.boxes.conf.cpu().tolist(),
+            ):
+                x1i, y1i, x2i, y2i = map(int, (x1, y1, x2, y2))
+                box = (x1i, y1i, x2i, y2i)
+                dets.append(Detection(frame_idx, tid, box, conf))
+                crop = frame[max(0, y1i):y2i, max(0, x1i):x2i]
+                h = hsv_hist(crop)
+                tracks.setdefault(tid, Track(tid)).add(frame_idx, box, conf, h)
+        frame_idx += 1
+        if frame_idx % 250 == 0:
+            print(f"  pass1 {frame_idx}/{max_frames}  tracks={len(tracks)}")
+    return dets, tracks
+
+
+def pass2_render(cap: cv2.VideoCapture, writer: cv2.VideoWriter,
+                 dets: list[Detection], remap: dict[int, int],
+                 dropped: set[int], fps: float, max_frames: int) -> int:
+    by_frame: dict[int, list[Detection]] = {}
+    for d in dets:
+        if d.tid in dropped:
+            continue
+        by_frame.setdefault(d.frame, []).append(d)
+
+    unique_canonical: set[int] = set()
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for frame_idx in range(max_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        current: list[int] = []
+        for d in by_frame.get(frame_idx, []):
+            canon = remap.get(d.tid, d.tid)
+            unique_canonical.add(canon)
+            current.append(canon)
+            x1, y1, x2, y2 = d.box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"cow #{canon} {d.conf:.2f}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
+            cv2.putText(frame, label, (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        hud = [
+            f"frame {frame_idx + 1}/{max_frames}  t={frame_idx / fps:5.1f}s",
+            f"in-frame cows: {len(current)}",
+            f"unique cows  : {len(unique_canonical)}",
+        ]
+        for i, line in enumerate(hud):
+            y = 30 + i * 28
+            cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(frame, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 255, 255), 2, cv2.LINE_AA)
+        writer.write(frame)
+        if (frame_idx + 1) % 500 == 0:
+            print(f"  pass2 {frame_idx + 1}/{max_frames}  unique={len(unique_canonical)}")
+
+    return len(unique_canonical)
+
+
+def main() -> None:
+    model = YOLO(str(MODEL_PATH))
+    cap = cv2.VideoCapture(str(VIDEO_PATH))
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open {VIDEO_PATH}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    max_frames = int(DURATION_SEC * fps)
+
+    print("--- pass 1: tracking ---")
+    dets, tracks = pass1_track(model, cap, fps, max_frames)
+    print(f"  raw tracks: {len(tracks)}  detections: {len(dets)}")
+
+    dropped = {tid for tid, t in tracks.items() if t.n_frames < MIN_TRACK_FRAMES}
+    print(f"  dropped <{MIN_TRACK_FRAMES}-frame noise tracks: {len(dropped)}")
+
+    print("--- merge: HSV + spatial + temporal ---")
+    remap = merge_tracks(tracks, fps)
+    canonical = {remap[t] for t in remap if t not in dropped}
+    print(f"  canonical tracks after merge: {len(canonical)}")
+
+    print("--- pass 2: rendering ---")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(OUT_PATH), fourcc, fps, (w, h))
+    unique = pass2_render(cap, writer, dets, remap, dropped, fps, max_frames)
+    cap.release()
+    writer.release()
+
+    print(f"\nDone. Unique cows: {unique}")
+    print(f"Output: {OUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
