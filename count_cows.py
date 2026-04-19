@@ -20,6 +20,9 @@ fall back to COCO YOLOv8m (class 19 == cow).
 
 from __future__ import annotations
 
+import argparse
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,16 +30,54 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+
+class FFmpegWriter:
+    """Pipe raw BGR frames to ffmpeg for H.264 encoding.
+
+    Output is ~5-10x smaller than cv2.VideoWriter('mp4v') at similar quality.
+    Falls back to cv2.VideoWriter if ffmpeg is not on PATH.
+    """
+
+    def __init__(self, path: Path, fps: float, w: int, h: int,
+                 crf: int = 23, preset: str = "medium") -> None:
+        self.path = path
+        self._cv_writer: cv2.VideoWriter | None = None
+        self._proc: subprocess.Popen | None = None
+        if shutil.which("ffmpeg") is None:
+            self._cv_writer = cv2.VideoWriter(
+                str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            return
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "pipe:0",
+            "-an",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(path),
+        ]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._proc is not None:
+            self._proc.stdin.write(frame.tobytes())
+        else:
+            self._cv_writer.write(frame)
+
+    def release(self) -> None:
+        if self._proc is not None:
+            self._proc.stdin.close()
+            self._proc.wait()
+        elif self._cv_writer is not None:
+            self._cv_writer.release()
+
 HERE = Path(__file__).parent
 MODEL_PATH = HERE / "yolov8m.pt"
-VIDEO_PATH = HERE / "NVR_ch1_main_20260331080000_20260331083835.mp4"
-OUT_PATH = HERE / "cows_annotated_first2min.mp4"
 TRACKER_YAML = HERE / "botsort_cows.yaml"
 
 COW_CLASS_ID = 19
 CONF_THRES = 0.30
 IOU_THRES = 0.5
-DURATION_SEC = 120
 DEVICE = "mps"
 IMGSZ = 1280
 
@@ -235,15 +276,53 @@ def pass2_render(cap: cv2.VideoCapture, writer: cv2.VideoWriter,
     return len(unique_canonical)
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Track + dedupe cows in a video and render an annotated MP4.",
+    )
+    p.add_argument("video", type=Path, help="input video (mp4, mov, avi, ...)")
+    p.add_argument("-o", "--out", type=Path, default=None,
+                   help="output MP4 path (default: <video>_annotated.mp4)")
+    p.add_argument("-d", "--duration", type=float, default=120.0,
+                   help="seconds to process from the start (default 120; 0 = whole video)")
+    p.add_argument("--conf", type=float, default=CONF_THRES,
+                   help=f"detector conf threshold (default {CONF_THRES})")
+    p.add_argument("--imgsz", type=int, default=IMGSZ,
+                   help=f"inference image size (default {IMGSZ})")
+    p.add_argument("--device", type=str, default=DEVICE,
+                   help=f"torch device: mps | cpu | 0 (cuda) (default {DEVICE})")
+    p.add_argument("--model", type=Path, default=MODEL_PATH,
+                   help=f"YOLO weights (default {MODEL_PATH.name})")
+    p.add_argument("--crf", type=int, default=23,
+                   help="H.264 quality: lower = better/larger (18 visually lossless, "
+                        "23 default, 28 very small). Default 23")
+    return p.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    video_path: Path = args.video
+    if not video_path.exists():
+        raise SystemExit(f"video not found: {video_path}")
+    out_path: Path = args.out or video_path.with_name(video_path.stem + "_annotated.mp4")
+
+    # let CLI overrides propagate to the inference helpers
+    global CONF_THRES, IMGSZ, DEVICE, MODEL_PATH
+    CONF_THRES, IMGSZ, DEVICE, MODEL_PATH = args.conf, args.imgsz, args.device, args.model
+
     model = YOLO(str(MODEL_PATH))
-    cap = cv2.VideoCapture(str(VIDEO_PATH))
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"cannot open {VIDEO_PATH}")
+        raise SystemExit(f"cannot open {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    max_frames = int(DURATION_SEC * fps)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    max_frames = total if args.duration == 0 else min(total, int(args.duration * fps))
+
+    print(f"input : {video_path}  ({w}x{h} @ {fps:.1f}fps, {total} frames)")
+    print(f"output: {out_path}")
+    print(f"window: first {max_frames} frames ({max_frames / fps:.1f}s)")
 
     print("--- pass 1: tracking ---")
     dets, tracks = pass1_track(model, cap, fps, max_frames)
@@ -257,15 +336,15 @@ def main() -> None:
     canonical = {remap[t] for t in remap if t not in dropped}
     print(f"  canonical tracks after merge: {len(canonical)}")
 
-    print("--- pass 2: rendering ---")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(OUT_PATH), fourcc, fps, (w, h))
+    print("--- pass 2: rendering (H.264 via ffmpeg) ---")
+    writer = FFmpegWriter(out_path, fps, w, h, crf=args.crf)
     unique = pass2_render(cap, writer, dets, remap, dropped, fps, max_frames)
     cap.release()
     writer.release()
 
+    size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"\nDone. Unique cows: {unique}")
-    print(f"Output: {OUT_PATH}")
+    print(f"Output: {out_path} ({size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":
