@@ -83,8 +83,9 @@ IMGSZ = 1280
 
 # --- merge-pass thresholds -------------------------------------------------
 MAX_TEMPORAL_GAP_S = 45.0   # do not merge tracks separated by more than this
-MAX_CENTER_DIST_PX = 450    # A-last-center to B-first-center (in full frame)
-HIST_SIM_THRESHOLD = 0.55   # 0..1 HSV-histogram correlation (higher = stricter)
+MIN_TEMPORAL_GAP_S = 0.5    # minimum gap; reject near-adjacent tracks fused on weak evidence
+MAX_CENTER_DIST_PX = 250    # A-last-center to B-first-center (full 1920x1080 frame)
+HIST_SIM_THRESHOLD = 0.72   # 0..1 HSV-histogram correlation (higher = stricter)
 MIN_TRACK_FRAMES = 3        # drop tracks this short as noise before merging
 
 
@@ -147,12 +148,23 @@ def center(box) -> tuple[float, float]:
 
 
 def merge_tracks(tracks: dict[int, Track], fps: float) -> dict[int, int]:
-    """Return {old_tid: canonical_tid}. Greedy pair merge by temporal order."""
+    """Return {old_tid: canonical_tid}. Greedy pair merge by temporal order.
+
+    Rejects a merge if B's lifetime overlaps any existing member of the
+    canonical group A belongs to (prevents duplicate IDs on simultaneously
+    visible cows when transitive chains would otherwise collapse distinct
+    animals into one).
+    """
     ordered = sorted(
         (t for t in tracks.values() if t.n_frames >= MIN_TRACK_FRAMES),
         key=lambda t: t.first_frame,
     )
     parent = {t.tid: t.tid for t in ordered}
+    by_tid = {t.tid: t for t in ordered}
+    # canonical_tid -> list of (first_frame, last_frame) for every member
+    group_intervals: dict[int, list[tuple[int, int]]] = {
+        t.tid: [(t.first_frame, t.last_frame)] for t in ordered
+    }
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -161,39 +173,57 @@ def merge_tracks(tracks: dict[int, Track], fps: float) -> dict[int, int]:
         return x
 
     max_gap_frames = MAX_TEMPORAL_GAP_S * fps
+    min_gap_frames = MIN_TEMPORAL_GAP_S * fps
     merges = 0
+    rejected_overlap = 0
     for i, a in enumerate(ordered):
         best_j: int | None = None
         best_score = -1.0
         for j in range(i + 1, len(ordered)):
             b = ordered[j]
-            # b must start strictly after a ends (no temporal overlap)
             gap = b.first_frame - a.last_frame
-            if gap <= 0 or gap > max_gap_frames:
+            if gap < min_gap_frames or gap > max_gap_frames:
                 continue
-            # spatial plausibility: a.last-center near b.first-center
             ax, ay = center(a.last_box)
             bx, by = center(b.first_box)
             dist = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
             if dist > MAX_CENTER_DIST_PX:
                 continue
-            # appearance: HSV histogram correlation in [-1, 1]; clip to [0, 1]
             sim = max(0.0, float(cv2.compareHist(a.hist, b.hist, cv2.HISTCMP_CORREL)))
             if sim < HIST_SIM_THRESHOLD:
                 continue
-            # score = appearance * spatial closeness * recency
             score = sim * (1 - dist / MAX_CENTER_DIST_PX) * (1 - gap / max_gap_frames)
             if score > best_score:
                 best_score = score
                 best_j = j
-        if best_j is not None:
-            b = ordered[best_j]
-            ra, rb = find(a.tid), find(b.tid)
-            if ra != rb:
-                parent[rb] = ra
-                merges += 1
+        if best_j is None:
+            continue
+        b = ordered[best_j]
+        ra, rb = find(a.tid), find(b.tid)
+        if ra == rb:
+            continue
+        # Transitive temporal-conflict check: B (and every member of B's group)
+        # must not overlap any existing member of A's canonical group.
+        a_intervals = group_intervals[ra]
+        b_intervals = group_intervals[rb]
+        conflict = False
+        for bf, bl in b_intervals:
+            for af, al in a_intervals:
+                if bf <= al and af <= bl:
+                    conflict = True
+                    break
+            if conflict:
+                break
+        if conflict:
+            rejected_overlap += 1
+            continue
+        parent[rb] = ra
+        group_intervals[ra] = a_intervals + b_intervals
+        del group_intervals[rb]
+        merges += 1
 
-    print(f"  merge pass: fused {merges} track pairs")
+    print(f"  merge pass: fused {merges} track pairs "
+          f"(rejected {rejected_overlap} overlap conflicts)")
     return {tid: find(tid) for tid in parent}
 
 

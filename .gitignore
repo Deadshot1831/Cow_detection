@@ -4,6 +4,7 @@
 *.mov
 *.avi
 *.mkv
+*.zip
 
 # --- model weights ---
 *.pt
