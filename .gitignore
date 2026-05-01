@@ -1,11 +1,16 @@
 # --- large media (input + output) ---
 *.cpv
+*.jpeg
+*.jpg
 *.mp4
 *.mov
 *.avi
 *.mkv
 *.zip
-
+Cow_image_output/
+image_output/
+Images/
+manual_checks/
 # --- model weights ---
 *.pt
 *.pth
